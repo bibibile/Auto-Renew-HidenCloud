@@ -225,7 +225,6 @@ def renew_service(page):
 
         log("🖱️ 准备点击 'Renew' 按钮...")
         renew_btn = page.locator('button:has-text("Renew")')
-        create_btn = page.locator('button:has-text("Create Invoice")')
 
         modal_opened = False
         for i in range(3):
@@ -241,17 +240,24 @@ def renew_service(page):
                 if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
                     log("⚠️ 未到续期时间，无法续期。")
                     page.screenshot(path="renew_not_allowed.png")
-                    return "NOT_TIME"   # 特殊状态
+                    return "NOT_TIME"
 
                 log("🖲️ 等待弹窗出现...")
+
+                # 只查找当前可见的 Create Invoice，避免命中隐藏/旧弹窗按钮
+                create_btn = page.locator(
+                    'button[type="submit"]:has-text("Create Invoice"):visible'
+                ).last
+
                 try:
                     create_btn.wait_for(state="visible", timeout=5000)
                     modal_opened = True
                     log("✅ 弹窗已成功弹出！")
                     break
-                except:
+                except Exception:
                     log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
                     time.sleep(2)
+
             except Exception as e:
                 log(f"❌ 点击尝试出错: {e}")
 
@@ -261,41 +267,90 @@ def renew_service(page):
             return False
 
         handle_cloudflare(page)
-        log("🖱️ 点击 'Create Invoice'...")
-        create_btn.click()
 
+        # 重新定位，确保使用当前可见弹窗中的 Create Invoice
+        create_btn = page.locator(
+            'button[type="submit"]:has-text("Create Invoice"):visible'
+        ).last
+
+        create_btn.wait_for(state="visible", timeout=10000)
+        create_btn.scroll_into_view_if_needed()
+        log("🖱️ 点击 'Create Invoice'...")
+
+        # HidenCloud 当前页面存在 backdrop 遮罩层：
+        # <div class="bg-gray-900/50 ... fixed inset-0 z-40">
+        # Playwright 普通 click 会被该遮罩拦截，因此采用多级点击策略。
+        clicked = False
+
+        try:
+            # 第一次：正常点击
+            create_btn.click(timeout=5000)
+            clicked = True
+            log("✅ 'Create Invoice' 已正常点击。")
+        except Exception as e:
+            log(f"⚠️ 普通点击被遮罩拦截，尝试 DOM click...")
+
+            try:
+                # 第二次：直接执行元素原生 click()
+                create_btn.evaluate("(el) => el.click()")
+                clicked = True
+                log("✅ 'Create Invoice' 已通过 DOM click 触发。")
+            except Exception as e2:
+                log(f"⚠️ DOM click 未成功，尝试强制点击...")
+
+                try:
+                    # 第三次：忽略遮罩层的命中检测
+                    create_btn.click(force=True, timeout=10000)
+                    clicked = True
+                    log("✅ 'Create Invoice' 已通过 force click 触发。")
+                except Exception as e3:
+                    log(f"❌ Create Invoice 点击失败: {e3}")
+
+        if not clicked:
+            page.screenshot(path="create_invoice_click_failed.png")
+            return False
+
+        # 等待发票页面跳转
         new_invoice_url = None
         start_wait = time.time()
+
         while time.time() - start_wait < 90:
             if "/payment/invoice/" in page.url:
                 new_invoice_url = page.url
                 log(f"🎉 页面已跳转: {new_invoice_url}")
                 break
+
             if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
                 log("⚠️ 遇到拦截，尝试处理...")
                 handle_cloudflare(page)
+
             time.sleep(1)
 
         if not new_invoice_url:
-            log("❌ 未能进入发票页面，超时。")
+            log(f"❌ 未能进入发票页面，当前URL: {page.url}")
             page.screenshot(path="renew_stuck_invoice.png")
             return False
 
         if page.url != new_invoice_url:
-            page.goto(new_invoice_url)
+            page.goto(new_invoice_url, wait_until="domcontentloaded", timeout=60000)
+
         handle_cloudflare(page)
 
         log("🔎 查找 'Pay' 按钮...")
-        pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
+        pay_btn = page.locator(
+            'a:has-text("Pay"):visible, button:has-text("Pay"):visible'
+        ).first
         pay_btn.wait_for(state="visible", timeout=30000)
         pay_btn.click()
         log("✅ 'Pay' 按钮已点击。")
 
         # 等待支付确认页面或跳转回服务页
         time.sleep(5)
+
         # 返回服务管理页面以获取新的到期时间
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
+
         return True
 
     except Exception as e:
