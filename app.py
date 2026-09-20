@@ -226,7 +226,12 @@ def renew_service(page):
         log("🖱️ 准备点击 'Renew' 按钮...")
         renew_btn = page.locator('button:has-text("Renew")')
 
+        # HidenCloud 的 Renew 弹窗 ID 与 Server ID 对应，例如：
+        # #renewService-207199
+        renew_modal = page.locator(f"#renewService-{server_id}")
+
         modal_opened = False
+
         for i in range(3):
             try:
                 renew_btn.wait_for(state="visible", timeout=10000)
@@ -234,8 +239,8 @@ def renew_service(page):
                 log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
                 renew_btn.click()
 
-                # 等待一小段时间，检测是否出现“未到续期时间”弹窗
                 time.sleep(2)
+
                 page_text = page.locator("body").inner_text()
                 if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
                     log("⚠️ 未到续期时间，无法续期。")
@@ -244,18 +249,25 @@ def renew_service(page):
 
                 log("🖲️ 等待弹窗出现...")
 
-                # 只查找当前可见的 Create Invoice，避免命中隐藏/旧弹窗按钮
-                create_btn = page.locator(
-                    'button[type="submit"]:has-text("Create Invoice"):visible'
-                ).last
-
+                # 直接定位本服务器对应的 Renew Modal。
+                # 不使用 :visible，避免 HidenCloud 当前页面的 backdrop/z-index
+                # 导致 Playwright 错误判断按钮状态。
                 try:
+                    renew_modal.wait_for(state="attached", timeout=5000)
+
+                    create_btn = renew_modal.locator(
+                        'button[type="submit"]',
+                        has_text="Create Invoice"
+                    )
+
                     create_btn.wait_for(state="visible", timeout=5000)
+
                     modal_opened = True
                     log("✅ 弹窗已成功弹出！")
                     break
-                except Exception:
-                    log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
+
+                except Exception as e:
+                    log(f"⚠️ 弹窗按钮未出现，准备重试... ({e})")
                     time.sleep(2)
 
             except Exception as e:
@@ -268,18 +280,17 @@ def renew_service(page):
 
         handle_cloudflare(page)
 
-        # 重新定位，确保使用当前可见弹窗中的 Create Invoice
-        create_btn = page.locator(
-            'button[type="submit"]:has-text("Create Invoice"):visible'
-        ).last
+        # 重新从当前服务器的 Modal 中定位 Create Invoice
+        create_btn = renew_modal.locator(
+            'button[type="submit"]',
+            has_text="Create Invoice"
+        )
 
         create_btn.wait_for(state="visible", timeout=10000)
         create_btn.scroll_into_view_if_needed()
+
         log("🖱️ 点击 'Create Invoice'...")
 
-        # HidenCloud 当前页面存在 backdrop 遮罩层：
-        # <div class="bg-gray-900/50 ... fixed inset-0 z-40">
-        # Playwright 普通 click 会被该遮罩拦截，因此采用多级点击策略。
         clicked = False
 
         try:
@@ -287,22 +298,25 @@ def renew_service(page):
             create_btn.click(timeout=5000)
             clicked = True
             log("✅ 'Create Invoice' 已正常点击。")
+
         except Exception as e:
-            log(f"⚠️ 普通点击被遮罩拦截，尝试 DOM click...")
+            log("⚠️ 普通点击被遮罩拦截，尝试 DOM click...")
 
             try:
-                # 第二次：直接执行元素原生 click()
+                # 第二次：直接执行按钮原生 click()
                 create_btn.evaluate("(el) => el.click()")
                 clicked = True
                 log("✅ 'Create Invoice' 已通过 DOM click 触发。")
-            except Exception as e2:
-                log(f"⚠️ DOM click 未成功，尝试强制点击...")
+
+            except Exception:
+                log("⚠️ DOM click 未成功，尝试 force click...")
 
                 try:
-                    # 第三次：忽略遮罩层的命中检测
+                    # 第三次：忽略遮罩层命中检测
                     create_btn.click(force=True, timeout=10000)
                     clicked = True
                     log("✅ 'Create Invoice' 已通过 force click 触发。")
+
                 except Exception as e3:
                     log(f"❌ Create Invoice 点击失败: {e3}")
 
@@ -344,10 +358,8 @@ def renew_service(page):
         pay_btn.click()
         log("✅ 'Pay' 按钮已点击。")
 
-        # 等待支付确认页面或跳转回服务页
         time.sleep(5)
 
-        # 返回服务管理页面以获取新的到期时间
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
 
@@ -357,6 +369,7 @@ def renew_service(page):
         log(f"❌ 续费异常: {e}")
         page.screenshot(path="renew_error.png")
         return False
+
 
 def main():
     # 检查必要环境变量
