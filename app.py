@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os,re,sys,time,random,requests,json,datetime,urllib.request
+import os,re,sys,time,random,requests
 from playwright.sync_api import sync_playwright
 
 # --- 环境变量 ---
@@ -10,7 +10,6 @@ EMAIL        = os.environ.get('EMAIL') or ""           # 登录邮箱,可选，�
 PASSWORD     = os.environ.get('PASSWORD') or ""        # 登录密码,可选，作为备用
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""    # Telegram Bot Token,可选
 TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""      # Telegram Chat ID,可选
-CRON_JOB     = os.environ.get('CRON_JOB') or ""       # Cron-Job.org: API_KEY,JOB_ID
 
 BASE_URL = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
@@ -85,103 +84,6 @@ def send_telegram_notification(status, old_due, new_due):
     except Exception as e:
         log(f"❌ Telegram 通知异常: {e}")
         return False
-
-def update_cronjob_schedule(run_time):
-    """将 Cron-Job.org 下一次执行时间设置为指定的北京时间"""
-    if not CRON_JOB or "," not in CRON_JOB:
-        log("⚠️ 未配置 CRON_JOB，跳过写回调度")
-        return False
-
-    try:
-        api_key, job_id = [x.strip() for x in CRON_JOB.split(",", 1)]
-
-        data = {
-            "job": {
-                "schedule": {
-                    "timezone": "Asia/Shanghai",
-                    "expiresAt": 0,
-                    "hours": [run_time.hour],
-                    "minutes": [run_time.minute],
-                    "mdays": [run_time.day],
-                    "months": [run_time.month],
-                    "wdays": [-1],
-                }
-            }
-        }
-
-        url = f"https://api.cron-job.org/jobs/{job_id}"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = json.dumps(data).encode("utf-8")
-
-        for attempt in range(3):
-            try:
-                req = urllib.request.Request(
-                    url, data=payload, headers=headers, method="PATCH"
-                )
-                with urllib.request.urlopen(req, timeout=15):
-                    pass
-                log(
-                    f"🔁 Cron 写回成功：下次触发 "
-                    f"{run_time.strftime('%Y-%m-%d %H:%M')}（北京时间）"
-                )
-                return True
-            except Exception as e:
-                log(f"⚠️ Cron 写回第{attempt + 1}次失败：{e}")
-                if attempt < 2:
-                    time.sleep(5)
-
-        return False
-    except Exception as e:
-        log(f"❌ Cron 写回异常：{e}")
-        return False
-
-
-def schedule_next_run_before_due(due_date_str):
-    """只有到期日前一天才能续期，自动计算下一次可续期时间。"""
-    try:
-        due_date = datetime.datetime.strptime(due_date_str, "%d %b %Y").date()
-        allowed_date = due_date - datetime.timedelta(days=1)
-
-        bj_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-        today = bj_now.date()
-
-        if today < allowed_date:
-            # 在可续期日前：安排到可续期日 00:05（北京时间）
-            # 在可续期日 08:00-08:59 随机安排执行时间
-            random_hour = 8
-            random_minute = random.randint(0, 59)
-            next_run = datetime.datetime.combine(
-                allowed_date,
-                datetime.time(hour=random_hour, minute=random_minute)
-            )
-            log(
-                f"⏳ 当前还不能续期：到期日 {due_date.strftime('%Y-%m-%d')}，"
-                f"可续期日为 {allowed_date.strftime('%Y-%m-%d')}，"
-                f"Cron 随机安排至 {next_run.strftime('%Y-%m-%d %H:%M')}"
-            )
-        else:
-            # 无论何时发现“未到续期时间”，统一安排到可续期日期当天
-            # 08:00-08:59 随机执行
-            random_hour = 8
-            random_minute = random.randint(0, 59)
-            next_run = datetime.datetime.combine(
-                allowed_date,
-                datetime.time(hour=random_hour, minute=random_minute)
-            )
-            log(
-                f"📅 可续期日为 {allowed_date.strftime('%Y-%m-%d')}，"
-                f"Cron 随机安排至 {next_run.strftime('%Y-%m-%d %H:%M')}"
-            )
-
-        update_cronjob_schedule(next_run)
-
-    except Exception as e:
-        log(f"❌ 计算下次可续期时间失败：{e}")
-        bj_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-        update_cronjob_schedule(bj_now + datetime.timedelta(minutes=5))
 
 def handle_cloudflare(page):
     iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
@@ -354,25 +256,9 @@ def renew_service(page):
                 log(f"❌ 点击尝试出错: {e}")
 
         if not modal_opened:
-            log("❌ 错误：3次尝试后，续费弹窗仍未出现。")
+            log("❌ 错误：尝试多次后，续费弹窗仍未出现。")
             page.screenshot(path="renew_modal_failed.png")
-
-            # 连续3次失败：10分钟后重新执行
-            bj_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-            retry_time = bj_now + datetime.timedelta(minutes=10)
-            log(
-                f"⏰ 连续3次续费尝试失败，Cron 将在10分钟后重试："
-                f"{retry_time.strftime('%Y-%m-%d %H:%M')}（北京时间）"
-            )
-            update_cronjob_schedule(retry_time)
-
-            # 立即推送 Telegram
-            send_telegram_notification(
-                "❌ 续期失败：连续3次尝试均未打开续费弹窗，已安排10分钟后重试",
-                getattr(sys.modules[__name__], "_CURRENT_OLD_DUE", "未知"),
-                getattr(sys.modules[__name__], "_CURRENT_OLD_DUE", "未知")
-            )
-            return "RETRY_10M"
+            return False
 
         handle_cloudflare(page)
         log("🖱️ 点击 'Create Invoice'...")
@@ -464,21 +350,10 @@ def main():
             old_due = get_due_date(page)
             log(f"📆 续费前到期时间：{old_due}")
 
-            # 保存当前 Due Date，供连续3次失败时的TG通知使用
-            global _CURRENT_OLD_DUE
-            _CURRENT_OLD_DUE = old_due
-
             # 执行续费
             renew_result = renew_service(page)
 
             new_due = old_due
-            if renew_result == "RETRY_10M":
-                # renew_service() 已经完成：
-                # 1. Cron 写回10分钟后
-                # 2. Telegram 推送
-                log("🔁 已安排10分钟后重试，本次任务正常结束")
-                sys.exit(0)
-
             if renew_result == "NOT_TIME":
                 log("⏳ 未到续期时间，目前无法续期")
                 status = "⏳ 未到续期时间"
@@ -494,30 +369,10 @@ def main():
             send_telegram_notification(status, old_due, new_due)
 
             if renew_result == "NOT_TIME":
-                if old_due != "未知":
-                    schedule_next_run_before_due(old_due)
-                else:
-                    log("⚠️ 无法获取 Due Date，5分钟后重试")
-                    bj_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-                    update_cronjob_schedule(bj_now + datetime.timedelta(minutes=5))
                 sys.exit(0)
             elif renew_result is False:
                 sys.exit(1)
             else:
-                # 正常续期成功：第7天 08:00-08:59 随机执行
-                bj_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-                target_date = (bj_now + datetime.timedelta(days=7)).date()
-                random_hour = 8
-                random_minute = random.randint(0, 59)
-                next_run = datetime.datetime.combine(
-                    target_date,
-                    datetime.time(hour=random_hour, minute=random_minute)
-                )
-                log(
-                    f"📅 续期成功，Cron 安排至 "
-                    f"{next_run.strftime('%Y-%m-%d %H:%M')}（北京时间）"
-                )
-                update_cronjob_schedule(next_run)
                 sys.exit(0)
         except Exception as e:
             log(f"❌ 浏览器启动出错: {e}")
